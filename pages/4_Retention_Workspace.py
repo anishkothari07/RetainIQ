@@ -27,8 +27,11 @@ from src.retention_engine import (
     RETENTION_PLAYBOOKS,
     prepare_retention_table,
     generate_campaign_export,
-    simulate_retention_scenario
+    simulate_retention_scenario,
+    find_optimal_threshold,
+    plot_profit_threshold_curve
 )
+from src.data_loader import load_customer_dashboard
 
 st.set_page_config(
     page_title="Retention Workspace | RetainIQ",
@@ -74,11 +77,29 @@ with st.sidebar:
         help="Focus budget on higher-value customer accounts."
     )
 
+    st.markdown("---")
+    st.markdown("### 🎯 Profit-Optimal Calibration")
+    use_opt_threshold = st.checkbox(
+        "Filter by Optimal Threshold (t*)",
+        value=False,
+        help="Filter retention candidate table to accounts meeting or exceeding the profit-optimal decision threshold."
+    )
+    opt_threshold_val = st.slider(
+        "Applied Decision Threshold",
+        min_value=0.10,
+        max_value=0.90,
+        value=0.20,
+        step=0.02,
+        help="Accounts with ChurnProbability >= this threshold qualify for targeted intervention."
+    )
+
 # Prepare filtered retention table
 retention_df = prepare_retention_table(
     risk_filter=sel_risk if sel_risk else None,
     segment_filter=sel_segments if sel_segments else None,
-    min_monetary=min_spend
+    min_monetary=min_spend,
+    min_probability=opt_threshold_val if use_opt_threshold else None,
+    optimal_threshold=opt_threshold_val if use_opt_threshold else None
 )
 
 # Top KPI Summary Cards
@@ -200,8 +221,12 @@ with pb_col3:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# Tabs: Campaign Table Builder vs Action Simulator
-tab_campaign, tab_sim = st.tabs(["📋 Retention Campaign Builder & Export", "🧮 Hypothetical Scenario Simulator"])
+# Tabs: Campaign Table Builder vs Profit-Optimal Solver vs Action Simulator
+tab_campaign, tab_solver, tab_sim = st.tabs([
+    "📋 Retention Campaign Builder & Export",
+    "🎯 Profit-Optimal Decision Threshold Solver",
+    "🧮 Hypothetical Scenario Simulator"
+])
 
 with tab_campaign:
     st.markdown(f"#### Priority-Ranked Retention Cohort ({len(retention_df)} Accounts)")
@@ -217,7 +242,11 @@ with tab_campaign:
         campaign_name_input = st.text_input("Campaign Name for CRM Export", value="Q4_High_Value_Winback")
     with exp_col2:
         st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-        export_csv_data = generate_campaign_export(retention_df, campaign_name_input).to_csv(index=False).encode("utf-8")
+        export_csv_data = generate_campaign_export(
+            retention_df,
+            campaign_name=campaign_name_input,
+            optimal_threshold=opt_threshold_val if use_opt_threshold else None
+        ).to_csv(index=False).encode("utf-8")
         st.download_button(
             label="📥 Export Campaign Cohort (CSV)",
             data=export_csv_data,
@@ -230,18 +259,124 @@ with tab_campaign:
     display_df = retention_df.copy()
     display_df["Historical Spend (£)"] = display_df["Monetary"]
     display_df["Risk-Weighted Spend (£)"] = display_df["RevenueAtRisk"]
+    if "TopRiskDriver" not in display_df.columns:
+        display_df["TopRiskDriver"] = "Extended Inactivity"
+
+    display_cols = [
+        "PriorityRank", "CustomerID", "Segment", "RiskCategory",
+        "ChurnProbability", "TopRiskDriver", "Historical Spend (£)", "Risk-Weighted Spend (£)", "RetentionAction", "Country"
+    ]
+    cols_to_render = [c for c in display_cols if c in display_df.columns]
 
     # Render Table
     st.dataframe(
-        display_df[[
-            "PriorityRank", "CustomerID", "Segment", "RiskCategory",
-            "ChurnProbability", "Historical Spend (£)", "Risk-Weighted Spend (£)", "RetentionAction", "Country"
-        ]].style.format({
+        display_df[cols_to_render].style.format({
             "ChurnProbability": "{:.4f}",
             "Historical Spend (£)": "£{:.2f}",
             "Risk-Weighted Spend (£)": "£{:.2f}"
         }),
         use_container_width=True,
+        height=400
+    )
+
+with tab_solver:
+    st.markdown("#### 🎯 Profit-Optimal Decision Threshold Solver")
+    st.markdown(
+        "Commercial campaigns should not default blindly to an arbitrary 50% statistical cutoff ($t = 0.50$). "
+        "RetainIQ maximizes **Net Expected Commercial Profit** by finding the threshold $t^*$ that balances retention revenue against intervention costs: "
+        r"$$\text{Net Expected Profit} = \sum_{i \in \text{TP}} (\text{LTV}_i \times \text{SaveRate}) - \sum_{i \in (\text{TP} \cup \text{FP})} \text{OutreachCost}$$",
+        unsafe_allow_html=True
+    )
+
+    sc1, sc2, sc3 = st.columns([1, 1, 1])
+    with sc1:
+        solver_cost = st.number_input(
+            "Outreach Cost per Account (£)",
+            min_value=1.0,
+            max_value=250.0,
+            value=15.0,
+            step=5.0,
+            help="Direct unit cost of outreach (concierge call, direct mail voucher, relationship manager outreach)."
+        )
+    with sc2:
+        solver_save_pct = st.slider(
+            "Retention Save Rate (%)",
+            min_value=1.0,
+            max_value=60.0,
+            value=20.0,
+            step=1.0,
+            help="Estimated percentage of contacted churners who are successfully saved."
+        )
+        solver_save_rate = solver_save_pct / 100.0
+    with sc3:
+        solver_scope = st.selectbox(
+            "Evaluation Dataset",
+            options=["Historical Cutoff Cohort (N = 3,370)", "Holdout Test Set (N = 674)"],
+            index=0
+        )
+
+    # Compute optimal threshold
+    if "Holdout" in solver_scope:
+        from src.data_loader import load_holdout_predictions
+        solver_data = load_holdout_predictions()
+    else:
+        solver_data = load_customer_dashboard()
+
+    opt_res = find_optimal_threshold(
+        y_true=solver_data["ActualChurn"].values,
+        y_prob=solver_data["ChurnProbability"].values,
+        ltv_series=solver_data["Monetary"].values,
+        outreach_cost=solver_cost,
+        save_rate=solver_save_rate
+    )
+
+    o1, o2, o3, o4 = st.columns(4)
+    with o1:
+        render_kpi_card(
+            label="Profit-Optimal Threshold (t*)",
+            value=f"{opt_res['optimal_threshold']:.2f}",
+            subtext=f"Default baseline: 0.50",
+            accent="emerald"
+        )
+    with o2:
+        render_kpi_card(
+            label="Max Expected Net Profit",
+            value=format_currency(opt_res["max_net_profit"]),
+            subtext="At optimal threshold t*",
+            accent="indigo"
+        )
+    with o3:
+        render_kpi_card(
+            label="Default Threshold Profit (t=0.50)",
+            value=format_currency(opt_res["default_net_profit"]),
+            subtext="Baseline uncalibrated profit",
+            accent="amber"
+        )
+    with o4:
+        lift_accent = "emerald" if opt_res["profit_lift"] >= 0 else "rose"
+        render_kpi_card(
+            label="Net Profit Lift",
+            value=f"+{format_currency(opt_res['profit_lift'])}",
+            subtext="Commercial gain over 0.50 cutoff",
+            accent=lift_accent
+        )
+
+    # Render Profit Curve
+    fig_profit_curve = plot_profit_threshold_curve(opt_res)
+    st.plotly_chart(fig_profit_curve, use_container_width=True)
+
+    st.markdown(
+        f"""
+        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem; margin-top: 0.5rem; font-size: 0.85rem; color: #334155; line-height: 1.55;">
+            <b>Decision Strategy Rationale:</b> At an outreach cost of <b>£{solver_cost:.2f}</b> and assumed save rate of <b>{solver_save_pct:.0f}%</b>, 
+            the mathematically optimal cutoff is <b>t* = {opt_res['optimal_threshold']:.2f}</b>. 
+            Targeting accounts at <code>ChurnProbability ≥ {opt_res['optimal_threshold']:.2f}</code> reaches <b>{opt_res['opt_targeted_count']} accounts</b>, 
+            delivering <b>{format_currency(opt_res['max_net_profit'])}</b> in net expected profit—a lift of <b>{format_currency(opt_res['profit_lift'])}</b> 
+            over the default 0.50 cutoff.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
         height=400
     )
 

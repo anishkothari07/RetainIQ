@@ -229,20 +229,32 @@ with tab2:
                 tenure_val = st.number_input("Tenure (Days since first order)", min_value=0, max_value=400, value=default_tenure, step=5)
                 aov_val = st.number_input("Average Order Value (£)", min_value=1.0, max_value=100000.0, value=default_aov, step=25.0)
 
+            with st.expander("⚡ Advanced Behavioral Dynamics (Cadence & Velocity)", expanded=False):
+                adv_ipi = st.number_input("Inter-Purchase Interval (Days)", min_value=0.0, max_value=365.0, value=float(round(tenure_val / max(freq_val - 1, 1), 1)))
+                adv_ratio = st.number_input("Recency / IPI Ratio", min_value=0.0, max_value=20.0, value=float(round(rec_val / (adv_ipi + 1.0), 2)))
+                adv_velocity = st.number_input("Spend Velocity Ratio", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
+                adv_decay = st.number_input("Frequency Decay ([-30,0] vs [-60,-31])", min_value=-50, max_value=50, value=0)
+                adv_canc = st.slider("Return / Cancellation Rate (%)", min_value=0.0, max_value=100.0, value=0.0) / 100.0
+
             run_pred = st.button("🚀 Calculate Live Churn Probability", use_container_width=True)
 
     with c_right:
         with st.container(border=True):
             st.markdown("##### 🔮 Inference Diagnostic Output")
 
-            # Run prediction
+            # Run prediction with local explainability
             pred_res = predict_churn(
                 recency=rec_val,
                 frequency=freq_val,
                 monetary=mon_val,
                 unique_products=prod_val,
                 tenure=tenure_val,
-                avg_order_value=aov_val
+                avg_order_value=aov_val,
+                avg_inter_purchase_days=adv_ipi,
+                recency_to_ipi_ratio=adv_ratio,
+                spend_velocity_ratio=adv_velocity,
+                frequency_decay=adv_decay,
+                return_cancellation_rate=adv_canc
             )
 
             p_churn = pred_res["churn_probability"]
@@ -263,13 +275,13 @@ with tab2:
                 f"""
                 <div style="text-align: center; padding: 1.25rem 0;">
                     <div style="font-size: 0.8rem; font-weight: 700; color: #64748B; text-transform: uppercase;">
-                        Computed Churn Likelihood
+                        Calibrated Churn Likelihood
                     </div>
                     <div style="font-size: 2.75rem; font-weight: 800; color: {badge_col}; line-height: 1.1; margin: 0.35rem 0;">
                         {formatted_prob}
                     </div>
                     <div style="font-size: 0.85rem; color: #64748B; margin-top: 2px;">
-                        Raw Score: <code>{p_churn:.4f}</code>
+                        Calibrated Probability: <code>{p_churn:.4f}</code>
                     </div>
                     <div style="margin: 0.75rem 0;">
                         <span style="background: {badge_col}1A; color: {badge_col}; border: 1px solid {badge_col}4D; padding: 0.35rem 1rem; border-radius: 9999px; font-weight: 700; font-size: 0.9rem;">
@@ -291,6 +303,24 @@ with tab2:
                 """,
                 unsafe_allow_html=True
             )
+
+            # Top 3 Customer-Specific Risk Drivers
+            top_drivers = pred_res.get("top_risk_drivers", [])
+            if top_drivers:
+                drivers_html = "".join([f"<li style='margin-bottom: 0.35rem;'><b>{d}</b></li>" for d in top_drivers])
+                st.markdown(
+                    f"""
+                    <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem; margin-top: 0.75rem;">
+                        <div style="font-size: 0.75rem; font-weight: 700; color: #4338CA; text-transform: uppercase; letter-spacing: 0.04em;">
+                            🧭 Top 3 Customer-Specific Risk Drivers (SHAP Local Attribution)
+                        </div>
+                        <ul style="font-size: 0.83rem; color: #334155; margin: 0.5rem 0 0 0; padding-left: 1.2rem; line-height: 1.55;">
+                            {drivers_html}
+                        </ul>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
 with tab3:
     st.markdown("#### 🔬 Standardized Pipeline Coefficients & Conditional Associations")

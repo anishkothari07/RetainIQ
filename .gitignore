@@ -1,28 +1,68 @@
-# Python
+# ==========================================
+# Byte-compiled / optimized / DLL files
+# ==========================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
-venv/
-.venv/
-ENV/
 
-# Streamlit
+# ==========================================
+# Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Testing & Coverage
+# ==========================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ==========================================
+# Jupyter Notebook Checkpoints & Cache
+# ==========================================
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ==========================================
+# Secrets, Environment & Local Config
+# ==========================================
+.env
+.env.*
+*.env
 .streamlit/*
 !.streamlit/config.toml
 
-# Testing & Linting
-.pytest_cache/
-.coverage
-htmlcov/
+# ==========================================
+# Operating System & IDE Temporary Files
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
 
-# IDE & OS
+# IDEs
 .vscode/
 .idea/
-.DS_Store
-Thumbs.db
+*.sublime-project
+*.sublime-workspace
 
-# Large Excel raw backup
+# ==========================================
+# Raw / Uncompressed Datasets
+# ==========================================
 Online Retail.xlsx

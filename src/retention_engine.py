@@ -54,7 +54,9 @@ def prepare_retention_table(
     risk_filter: Optional[List[str]] = None,
     segment_filter: Optional[List[str]] = None,
     country_filter: Optional[List[str]] = None,
-    min_monetary: float = 0.0
+    min_monetary: float = 0.0,
+    min_probability: Optional[float] = None,
+    optimal_threshold: Optional[float] = None
 ) -> pd.DataFrame:
     """
     Builds the operational retention workspace table with priority ranking.
@@ -70,6 +72,10 @@ def prepare_retention_table(
     df["RevenueAtRisk"] = df["RiskWeightedHistoricalSpend"]
     df["PriorityScore"] = df["RiskWeightedHistoricalSpend"]
 
+    # Flag qualification under optimal decision threshold t*
+    if optimal_threshold is not None:
+        df["OptimalTargetQualified"] = df["ChurnProbability"] >= optimal_threshold
+
     # Apply filters
     if risk_filter:
         df = df[df["RiskCategory"].isin(risk_filter)]
@@ -79,6 +85,8 @@ def prepare_retention_table(
         df = df[df["Country"].isin(country_filter)]
     if min_monetary > 0:
         df = df[df["Monetary"] >= min_monetary]
+    if min_probability is not None:
+        df = df[df["ChurnProbability"] >= min_probability]
 
     # Sort by priority score descending
     df = df.sort_values("PriorityScore", ascending=False).reset_index(drop=True)
@@ -89,7 +97,8 @@ def prepare_retention_table(
 
 def generate_campaign_export(
     selected_df: pd.DataFrame,
-    campaign_name: str = "RetainIQ_Campaign"
+    campaign_name: str = "RetainIQ_Campaign",
+    optimal_threshold: Optional[float] = None
 ) -> pd.DataFrame:
     """
     Enriches selected customer cohort with campaign execution fields for CRM ingestion.
@@ -103,6 +112,9 @@ def generate_campaign_export(
     export_df["IncentiveTier"] = export_df["RiskCategory"].map(
         lambda r: RETENTION_PLAYBOOKS.get(r, {}).get("incentive_guideline", "Standard Offer")
     )
+    if optimal_threshold is not None:
+        export_df["OptimalThresholdApplied"] = optimal_threshold
+        export_df["OptimalTargetQualified"] = export_df["ChurnProbability"] >= optimal_threshold
 
     output_cols = [
         "PriorityRank",
@@ -110,16 +122,160 @@ def generate_campaign_export(
         "Segment",
         "RiskCategory",
         "ChurnProbability",
+        "TopRiskDriver",
         "Monetary",
         "RiskWeightedHistoricalSpend",
         "RevenueAtRisk",
         "RetentionAction",
         "OutreachChannel",
         "IncentiveTier",
+        "OptimalTargetQualified",
         "Country"
     ]
     cols_to_use = [c for c in output_cols if c in export_df.columns]
     return export_df[cols_to_use]
+
+
+def find_optimal_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    ltv_series: np.ndarray,
+    outreach_cost: float = 15.0,
+    save_rate: float = 0.20,
+    n_steps: int = 81
+) -> Dict[str, Any]:
+    """
+    Sweeps decision thresholds from 0.10 to 0.90 to find t* maximizing:
+    Net Expected Profit = sum_{i in TP} (LTV_i * SaveRate) - sum_{i in (TP U FP)} OutreachCost
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+    ltv = np.asarray(ltv_series).astype(float)
+
+    thresholds = np.linspace(0.10, 0.90, n_steps)
+    net_profits = []
+    saved_revs = []
+    costs = []
+    targeted_counts = []
+    tp_counts = []
+    fp_counts = []
+
+    for t in thresholds:
+        targeted = y_prob >= t
+        tp_mask = targeted & (y_true == 1)
+        fp_mask = targeted & (y_true == 0)
+
+        saved_rev = float(np.sum(ltv[tp_mask] * save_rate))
+        cost = float(np.sum(targeted) * outreach_cost)
+        net_profit = float(saved_rev - cost)
+
+        net_profits.append(net_profit)
+        saved_revs.append(saved_rev)
+        costs.append(cost)
+        targeted_counts.append(int(np.sum(targeted)))
+        tp_counts.append(int(np.sum(tp_mask)))
+        fp_counts.append(int(np.sum(fp_mask)))
+
+    best_idx = int(np.argmax(net_profits))
+    idx_50 = int(np.argmin(np.abs(thresholds - 0.50)))
+
+    opt_t = float(thresholds[best_idx])
+    max_profit = float(net_profits[best_idx])
+    default_profit = float(net_profits[idx_50])
+
+    return {
+        "optimal_threshold": round(opt_t, 2),
+        "max_net_profit": round(max_profit, 2),
+        "default_threshold": 0.50,
+        "default_net_profit": round(default_profit, 2),
+        "profit_lift": round(max_profit - default_profit, 2),
+        "thresholds": [round(float(x), 4) for x in thresholds],
+        "net_profits": [round(float(x), 2) for x in net_profits],
+        "saved_revenues": [round(float(x), 2) for x in saved_revs],
+        "outreach_costs": [round(float(x), 2) for x in costs],
+        "targeted_counts": targeted_counts,
+        "tp_counts": tp_counts,
+        "fp_counts": fp_counts,
+        "opt_targeted_count": targeted_counts[best_idx],
+        "default_targeted_count": targeted_counts[idx_50],
+        "outreach_cost": float(outreach_cost),
+        "save_rate": float(save_rate)
+    }
+
+
+def plot_profit_threshold_curve(opt_results: Dict[str, Any]) -> Any:
+    """
+    Renders an interactive Net Profit vs Decision Threshold curve using Plotly,
+    marking the optimal threshold t* vs default 0.50.
+    """
+    import plotly.graph_objects as go
+    from src.utils import get_plotly_theme, PRIMARY
+
+    thresholds = opt_results["thresholds"]
+    profits = opt_results["net_profits"]
+    opt_t = opt_results["optimal_threshold"]
+    max_p = opt_results["max_net_profit"]
+    def_p = opt_results["default_net_profit"]
+
+    fig = go.Figure()
+
+    # Zero profit horizontal line
+    fig.add_trace(go.Scatter(
+        x=[0.10, 0.90],
+        y=[0, 0],
+        mode="lines",
+        name="Break-Even (£0)",
+        line=dict(color="#94A3B8", dash="dash", width=1.5)
+    ))
+
+    # Net Profit Curve
+    fig.add_trace(go.Scatter(
+        x=thresholds,
+        y=profits,
+        mode="lines",
+        name="Expected Net Profit",
+        line=dict(color=PRIMARY, width=3),
+        fill="tozeroy",
+        fillcolor="rgba(79, 70, 229, 0.08)"
+    ))
+
+    # Marker for Optimal Threshold t*
+    fig.add_trace(go.Scatter(
+        x=[opt_t],
+        y=[max_p],
+        mode="markers+text",
+        name=f"Optimal t* = {opt_t:.2f} (£{max_p:,.0f})",
+        marker=dict(color="#10B981", size=13, symbol="star"),
+        text=[f"  <b>Optimal t* = {opt_t:.2f}</b><br>  Max Profit: £{max_p:,.0f}"],
+        textposition="top right",
+        textfont=dict(color="#065F46", size=11, family="Plus Jakarta Sans")
+    ))
+
+    # Marker for Default 0.50
+    fig.add_trace(go.Scatter(
+        x=[0.50],
+        y=[def_p],
+        mode="markers+text",
+        name=f"Default 0.50 (£{def_p:,.0f})",
+        marker=dict(color="#F59E0B", size=10, symbol="diamond"),
+        text=[f"  Default 0.50<br>  Profit: £{def_p:,.0f}"],
+        textposition="bottom right",
+        textfont=dict(color="#92400E", size=10, family="Plus Jakarta Sans")
+    ))
+
+    fig.update_layout(
+        **get_plotly_theme(
+            title=dict(
+                text=f"<b>Net Commercial Profit vs. Decision Threshold (Lift at t*: +£{opt_results['profit_lift']:,.0f})</b>",
+                font=dict(size=14)
+            ),
+            xaxis=dict(title="Decision Threshold (t)", range=[0.08, 0.92]),
+            yaxis=dict(title="Net Expected Profit (£)"),
+            height=340,
+            legend=dict(x=0.03, y=0.97)
+        )
+    )
+    return fig
 
 
 def simulate_retention_scenario(

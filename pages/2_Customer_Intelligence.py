@@ -30,6 +30,7 @@ from src.data_loader import (
     load_rfm_segments
 )
 from src.customer_analytics import get_customer_profile, get_customer_invoices
+from src.churn_engine import get_top_risk_drivers_for_customer
 from src.segmentation import (
     get_segment_comparison,
     get_segment_risk_crosstab,
@@ -286,7 +287,7 @@ with tab1:
                         </div>
                     </div>
 
-                    <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem; margin-top: 1.25rem;">
+                    <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem; margin-top: 1rem;">
                         <div style="font-size: 0.75rem; font-weight: 700; color: #64748B; text-transform: uppercase;">RECOMMENDED ACTION</div>
                         <div style="font-size: 0.98rem; font-weight: 700; color: #0F172A; margin: 0.35rem 0;">
                             {cp['retention_action']}
@@ -299,6 +300,24 @@ with tab1:
                     """,
                     unsafe_allow_html=True
                 )
+
+                # Fetch and render Top 3 Customer-Specific Risk Drivers
+                drivers = get_top_risk_drivers_for_customer(selected_customer_id)
+                if drivers:
+                    drivers_html = "".join([f"<li style='margin-bottom: 0.35rem;'><b>{d}</b></li>" for d in drivers])
+                    st.markdown(
+                        f"""
+                        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 0.85rem 1rem; margin-top: 0.75rem;">
+                            <div style="font-size: 0.75rem; font-weight: 700; color: #4338CA; text-transform: uppercase; letter-spacing: 0.04em;">
+                                🧭 Primary Risk Drivers (SHAP Local Attribution)
+                            </div>
+                            <ul style="font-size: 0.83rem; color: #334155; margin: 0.45rem 0 0 0; padding-left: 1.2rem; line-height: 1.5;">
+                                {drivers_html}
+                            </ul>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
 
     else:
         st.info("ℹ️ Account joined after Sep 10, 2011 cutoff date. Churn Probability: N/A (Not evaluated in historical 2011 cohort).")

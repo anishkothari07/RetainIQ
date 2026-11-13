@@ -90,14 +90,19 @@ def test_historical_cohort_segment_counts():
 
 
 def test_churn_engine_artifact_and_inference():
-    """Verify Joblib model artifact loading and live inference."""
+    """Verify Joblib model artifact loading and live calibrated inference."""
     artifact = load_churn_model_artifact()
-    assert artifact["model_name"] == "Logistic Regression"
-    assert abs(artifact["cv_roc_auc"] - 0.7470) < 0.001
-    assert abs(artifact["holdout_roc_auc"] - 0.7238) < 0.001
-    assert len(artifact["features"]) == 6
+    assert artifact["model_name"] in [
+        "Calibrated HistGradientBoosting",
+        "Calibrated HistGBM",
+        "Logistic Regression"
+    ]
+    assert artifact["cv_roc_auc"] >= 0.74
+    assert artifact["holdout_roc_auc"] >= 0.71
+    assert len(artifact["features"]) >= 6
+    assert "cv_brier" in artifact or "holdout_brier" in artifact
 
-    # Test sample inference
+    # Test sample inference (with 6 base features and automatic velocity imputation)
     res = predict_churn(
         recency=15,
         frequency=5,
@@ -110,6 +115,8 @@ def test_churn_engine_artifact_and_inference():
     assert res["predicted_churn"] in [0, 1]
     assert res["risk_category"] in ["Low", "Medium", "High"]
     assert isinstance(res["retention_action"], str)
+    assert "top_risk_drivers" in res
+    assert len(res["top_risk_drivers"]) <= 3
 
 
 def test_risk_classification_thresholds():
@@ -191,3 +198,72 @@ def test_probability_formatting_helpers():
     assert format_probability_decimal(None) == "N/A"
     assert format_probability_pct(np.nan) == "N/A"
     assert format_probability_decimal(np.nan) == "N/A"
+
+
+def test_temporal_velocity_zero_leakage_and_invariance():
+    """Verify that velocity features are leakage-free and invariant to future transactions."""
+    from src.preprocessing import compute_cadence_velocity_features, VELOCITY_FEATURES
+
+    cutoff = pd.Timestamp("2011-09-10 12:50:00")
+    tx_pre = pd.DataFrame([
+        {"CustomerID": 99999, "InvoiceNo": "10001", "Quantity": 2, "UnitPrice": 10.0,
+         "InvoiceDate": pd.Timestamp("2011-05-01 10:00:00"), "StockCode": "A"},
+        {"CustomerID": 99999, "InvoiceNo": "10002", "Quantity": 3, "UnitPrice": 15.0,
+         "InvoiceDate": pd.Timestamp("2011-08-20 11:00:00"), "StockCode": "B"},
+        {"CustomerID": 99999, "InvoiceNo": "C10003", "Quantity": -1, "UnitPrice": 15.0,
+         "InvoiceDate": pd.Timestamp("2011-08-25 12:00:00"), "StockCode": "B"},
+    ])
+    f_clean = compute_cadence_velocity_features(tx_pre, reference_date=cutoff)
+
+    # Adding post-cutoff transactions (> 2011-09-10) must produce identical features
+    future_tx = pd.DataFrame([
+        {"CustomerID": 99999, "InvoiceNo": "10004", "Quantity": 50, "UnitPrice": 100.0,
+         "InvoiceDate": pd.Timestamp("2011-10-15 10:00:00"), "StockCode": "C"},
+        {"CustomerID": 99999, "InvoiceNo": "C10005", "Quantity": -10, "UnitPrice": 100.0,
+         "InvoiceDate": pd.Timestamp("2011-11-01 10:00:00"), "StockCode": "C"},
+    ])
+    tx_with_future = pd.concat([tx_pre, future_tx], ignore_index=True)
+    f_future = compute_cadence_velocity_features(tx_with_future, reference_date=cutoff)
+
+    for col in VELOCITY_FEATURES:
+        assert col in f_clean.columns
+        assert not f_clean[col].isnull().any()
+        val_clean = f_clean[col].iloc[0]
+        val_future = f_future[col].iloc[0]
+        assert np.isclose(val_clean, val_future), f"Leakage detected in {col}: {val_clean} != {val_future}"
+
+
+def test_calibrated_probability_bounds_and_brier_improvement():
+    """Verify calibrated probability bounds, Brier score quality, and Precision@Top15%."""
+    from src.metrics import get_holdout_evaluation_metrics, BENCHMARKS
+
+    res = get_holdout_evaluation_metrics()
+    assert 0.0 <= res["brier_score"] <= 0.25
+    assert res["pr_auc"] >= 0.58
+    assert res["precision_at_top15"] >= 0.65
+
+    # Benchmark comparison verifies calibrated model achieves lowest Brier loss
+    cal_brier = BENCHMARKS["Calibrated HistGBM"]["holdout_brier"]
+    lr_brier = BENCHMARKS["Logistic Regression"]["holdout_brier"]
+    assert cal_brier < lr_brier, f"Calibrated Brier ({cal_brier}) should be lower than baseline ({lr_brier})"
+
+
+def test_profit_optimal_threshold_solver_math():
+    """Verify profit-optimal threshold solver sweeps, monotonicity, and lift over 0.50 default."""
+    from src.retention_engine import find_optimal_threshold
+
+    y_true = np.array([1, 1, 1, 0, 0, 1, 0, 1, 0, 0])
+    y_prob = np.array([0.85, 0.75, 0.65, 0.45, 0.35, 0.55, 0.25, 0.90, 0.15, 0.10])
+    ltv = np.array([100.0, 200.0, 150.0, 80.0, 50.0, 300.0, 40.0, 250.0, 20.0, 10.0])
+
+    # Standard run
+    res = find_optimal_threshold(y_true, y_prob, ltv, outreach_cost=10.0, save_rate=0.20)
+    assert 0.10 <= res["optimal_threshold"] <= 0.90
+    assert res["max_net_profit"] >= res["default_net_profit"]
+    assert res["profit_lift"] >= 0.0
+
+    # Sensitivity check: High unit cost increases threshold t*
+    res_low_cost = find_optimal_threshold(y_true, y_prob, ltv, outreach_cost=5.0, save_rate=0.20)
+    res_high_cost = find_optimal_threshold(y_true, y_prob, ltv, outreach_cost=40.0, save_rate=0.20)
+    assert res_high_cost["optimal_threshold"] >= res_low_cost["optimal_threshold"]
+    assert res_high_cost["opt_targeted_count"] <= res_low_cost["opt_targeted_count"]
