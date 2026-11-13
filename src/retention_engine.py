@@ -147,6 +147,16 @@ def find_optimal_threshold(
     """
     Sweeps decision thresholds from 0.10 to 0.90 to find t* maximizing:
     Net Expected Profit = sum_{i in TP} (LTV_i * SaveRate) - sum_{i in (TP U FP)} OutreachCost
+
+    METHODOLOGICAL NOTICE:
+    1. Out-of-Sample Discipline: This optimization must strictly be evaluated on
+       held-out / test customers, NEVER on the dataset used to train model parameters.
+    2. LTV Proxy Definition: In this historical non-contractual retail dataset, customer LTV
+       is represented by historical cumulative monetary spend (£). It serves as a heuristic
+       proxy for expected preserved value under the assumption that retained customers continue
+       purchasing at their historical baseline rate. It is not a verified forward-looking contractual value.
+    3. Scenario Nature: Net expected profits are hypothetical scenario estimates based on assumed
+       unit outreach costs and retention save rates, not verified causal treatment effects (uplift).
     """
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob).astype(float)
@@ -201,6 +211,257 @@ def find_optimal_threshold(
         "outreach_cost": float(outreach_cost),
         "save_rate": float(save_rate)
     }
+
+
+def compare_retention_strategies(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    ltv_series: np.ndarray,
+    outreach_cost: float = 15.0,
+    save_rate: float = 0.20,
+    target_count: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Rigorously benchmarks 5 distinct intervention strategies against the default 0.50 baseline:
+    1. Contact Nobody: Zero outreach cost, zero preserved revenue.
+    2. Contact Everyone: Blanket outreach across all accounts regardless of risk.
+    3. Contact Top-N by Churn Risk: Prioritizes purely by highest P(churn).
+    4. Contact Top-N by Expected Value at Risk: Prioritizes by LTV * P(churn).
+    5. Optimal Threshold (t*): Selects accounts meeting the profit-maximizing threshold.
+    6. (Reference) Default Cutoff (t=0.50): Arbitrary industry 50% cutoff.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+    ltv = np.asarray(ltv_series).astype(float)
+    n_total = len(y_true)
+
+    # Solve optimal threshold
+    opt_res = find_optimal_threshold(y_true, y_prob, ltv, outreach_cost=outreach_cost, save_rate=save_rate)
+    opt_t = opt_res["optimal_threshold"]
+    k_star = opt_res["opt_targeted_count"]
+    k = target_count if target_count is not None else k_star
+
+    rows = []
+
+    # Strategy 1: Contact Nobody
+    rows.append({
+        "Strategy": "1. Contact Nobody",
+        "Targeting Logic": "No intervention",
+        "Accounts Contacted": 0,
+        "Contact Rate (%)": 0.0,
+        "Campaign Cost (£)": 0.0,
+        "Churners Saved": 0.0,
+        "Gross Saved (£)": 0.0,
+        "Net Expected Profit (£)": 0.0,
+        "ROI (%)": 0.0
+    })
+
+    # Strategy 2: Contact Everyone
+    cost_all = n_total * outreach_cost
+    saved_churners_all = float(np.sum(y_true == 1) * save_rate)
+    gross_all = float(np.sum(ltv[y_true == 1] * save_rate))
+    net_all = gross_all - cost_all
+    roi_all = (net_all / cost_all * 100.0) if cost_all > 0 else 0.0
+    rows.append({
+        "Strategy": "2. Contact Everyone",
+        "Targeting Logic": "Blanket outreach to entire cohort",
+        "Accounts Contacted": n_total,
+        "Contact Rate (%)": 100.0,
+        "Campaign Cost (£)": cost_all,
+        "Churners Saved": round(saved_churners_all, 1),
+        "Gross Saved (£)": gross_all,
+        "Net Expected Profit (£)": net_all,
+        "ROI (%)": roi_all
+    })
+
+    # Strategy 3: Top-N by Risk Probability
+    k_clamped = max(1, min(k, n_total))
+    risk_rank = np.argsort(y_prob)[::-1][:k_clamped]
+    cost_risk = k_clamped * outreach_cost
+    saved_churners_risk = float(np.sum(y_true[risk_rank] == 1) * save_rate)
+    gross_risk = float(np.sum(ltv[risk_rank][y_true[risk_rank] == 1] * save_rate))
+    net_risk = gross_risk - cost_risk
+    roi_risk = (net_risk / cost_risk * 100.0) if cost_risk > 0 else 0.0
+    rows.append({
+        "Strategy": f"3. Top-{k_clamped} by Churn Risk",
+        "Targeting Logic": f"Highest {k_clamped} accounts by P(churn)",
+        "Accounts Contacted": k_clamped,
+        "Contact Rate (%)": round(k_clamped / n_total * 100.0, 1),
+        "Campaign Cost (£)": cost_risk,
+        "Churners Saved": round(saved_churners_risk, 1),
+        "Gross Saved (£)": gross_risk,
+        "Net Expected Profit (£)": net_risk,
+        "ROI (%)": roi_risk
+    })
+
+    # Strategy 4: Top-N by Expected Value at Risk (LTV * P(churn))
+    evar = ltv * y_prob
+    evar_rank = np.argsort(evar)[::-1][:k_clamped]
+    cost_evar = k_clamped * outreach_cost
+    saved_churners_evar = float(np.sum(y_true[evar_rank] == 1) * save_rate)
+    gross_evar = float(np.sum(ltv[evar_rank][y_true[evar_rank] == 1] * save_rate))
+    net_evar = gross_evar - cost_evar
+    roi_evar = (net_evar / cost_evar * 100.0) if cost_evar > 0 else 0.0
+    rows.append({
+        "Strategy": f"4. Top-{k_clamped} by Value at Risk",
+        "Targeting Logic": f"Highest {k_clamped} accounts by LTV × P(churn)",
+        "Accounts Contacted": k_clamped,
+        "Contact Rate (%)": round(k_clamped / n_total * 100.0, 1),
+        "Campaign Cost (£)": cost_evar,
+        "Churners Saved": round(saved_churners_evar, 1),
+        "Gross Saved (£)": gross_evar,
+        "Net Expected Profit (£)": net_evar,
+        "ROI (%)": roi_evar
+    })
+
+    # Strategy 5: Optimal Decision Threshold t*
+    mask_opt = y_prob >= opt_t
+    n_opt = int(np.sum(mask_opt))
+    cost_opt = n_opt * outreach_cost
+    saved_churners_opt = float(np.sum(mask_opt & (y_true == 1)) * save_rate)
+    gross_opt = float(np.sum(ltv[mask_opt & (y_true == 1)] * save_rate))
+    net_opt = gross_opt - cost_opt
+    roi_opt = (net_opt / cost_opt * 100.0) if cost_opt > 0 else 0.0
+    rows.append({
+        "Strategy": f"5. Optimal Threshold (t* = {opt_t:.2f})",
+        "Targeting Logic": f"Accounts with P(churn) ≥ {opt_t:.2f}",
+        "Accounts Contacted": n_opt,
+        "Contact Rate (%)": round(n_opt / n_total * 100.0, 1),
+        "Campaign Cost (£)": cost_opt,
+        "Churners Saved": round(saved_churners_opt, 1),
+        "Gross Saved (£)": gross_opt,
+        "Net Expected Profit (£)": net_opt,
+        "ROI (%)": roi_opt
+    })
+
+    # Reference Strategy 6: Default 0.50 Threshold
+    mask_50 = y_prob >= 0.50
+    n_50 = int(np.sum(mask_50))
+    cost_50 = n_50 * outreach_cost
+    saved_churners_50 = float(np.sum(mask_50 & (y_true == 1)) * save_rate)
+    gross_50 = float(np.sum(ltv[mask_50 & (y_true == 1)] * save_rate))
+    net_50 = gross_50 - cost_50
+    roi_50 = (net_50 / cost_50 * 100.0) if cost_50 > 0 else 0.0
+    rows.append({
+        "Strategy": "Reference: Default (t = 0.50)",
+        "Targeting Logic": "Accounts with P(churn) ≥ 0.50",
+        "Accounts Contacted": n_50,
+        "Contact Rate (%)": round(n_50 / n_total * 100.0, 1),
+        "Campaign Cost (£)": cost_50,
+        "Churners Saved": round(saved_churners_50, 1),
+        "Gross Saved (£)": gross_50,
+        "Net Expected Profit (£)": net_50,
+        "ROI (%)": roi_50
+    })
+
+    return pd.DataFrame(rows)
+
+
+def compute_profit_sensitivity_grid(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    ltv_series: np.ndarray,
+    save_rates: Optional[List[float]] = None,
+    outreach_costs: Optional[List[float]] = None
+) -> Dict[str, Any]:
+    """
+    Computes a 4x4 sensitivity grid over save_rates in {5, 10, 20, 30}% and
+    outreach_costs in {5, 15, 30, 50} GBP showing optimal threshold t*,
+    number of contacted accounts, and expected net profit.
+    """
+    if save_rates is None:
+        save_rates = [0.05, 0.10, 0.20, 0.30]
+    if outreach_costs is None:
+        outreach_costs = [5.0, 15.0, 30.0, 50.0]
+
+    records = []
+    for s in save_rates:
+        for c in outreach_costs:
+            res = find_optimal_threshold(y_true, y_prob, ltv_series, outreach_cost=c, save_rate=s)
+            records.append({
+                "save_rate": s,
+                "save_rate_pct": int(round(s * 100)),
+                "outreach_cost": c,
+                "cost_str": f"£{c:.0f}",
+                "optimal_threshold": res["optimal_threshold"],
+                "opt_targeted_count": res["opt_targeted_count"],
+                "max_net_profit": res["max_net_profit"],
+                "default_net_profit": res["default_net_profit"],
+                "profit_lift": res["profit_lift"],
+            })
+
+    df = pd.DataFrame(records)
+
+    profit_pivot = df.pivot(index="save_rate_pct", columns="cost_str", values="max_net_profit")
+    threshold_pivot = df.pivot(index="save_rate_pct", columns="cost_str", values="optimal_threshold")
+    targeted_pivot = df.pivot(index="save_rate_pct", columns="cost_str", values="opt_targeted_count")
+
+    return {
+        "records": records,
+        "df": df,
+        "profit_pivot": profit_pivot,
+        "threshold_pivot": threshold_pivot,
+        "targeted_pivot": targeted_pivot,
+        "save_rates": save_rates,
+        "outreach_costs": outreach_costs
+    }
+
+
+def plot_profit_sensitivity_heatmap(grid_dict: Dict[str, Any]) -> Any:
+    """
+    Renders an interactive Plotly Heatmap showing net profit across unit costs and save rates,
+    annotating each cell with optimal threshold t* and targeted account volume.
+    """
+    import plotly.graph_objects as go
+    from src.utils import get_plotly_theme
+
+    df = grid_dict["df"]
+    costs = sorted(df["outreach_cost"].unique())
+    saves = sorted(df["save_rate"].unique())
+
+    cost_labels = [f"£{int(c)}" for c in costs]
+    save_labels = [f"{int(s*100)}%" for s in saves]
+
+    z_matrix = []
+    text_matrix = []
+
+    for s in saves:
+        z_row = []
+        text_row = []
+        for c in costs:
+            sub = df[(df["save_rate"] == s) & (df["outreach_cost"] == c)].iloc[0]
+            prof = sub["max_net_profit"]
+            opt_t = sub["optimal_threshold"]
+            k = sub["opt_targeted_count"]
+            z_row.append(prof)
+            text_row.append(f"<b>£{prof:,.0f}</b><br>t*={opt_t:.2f} (N={k})")
+        z_matrix.append(z_row)
+        text_matrix.append(text_row)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z_matrix,
+        x=cost_labels,
+        y=save_labels,
+        text=text_matrix,
+        texttemplate="%{text}",
+        textfont=dict(size=11, family="Plus Jakarta Sans"),
+        colorscale="Blues",
+        colorbar=dict(title="Net Profit (£)"),
+        hoverongaps=False
+    ))
+
+    fig.update_layout(
+        **get_plotly_theme(
+            title=dict(
+                text="<b>Profit Sensitivity Grid (Net Profit, Optimal t*, & Contacted Accounts)</b>",
+                font=dict(size=14)
+            ),
+            xaxis=dict(title="Unit Outreach Cost (£ per Customer)"),
+            yaxis=dict(title="Assumed Retention Save Rate (%)"),
+            height=340
+        )
+    )
+    return fig
 
 
 def plot_profit_threshold_curve(opt_results: Dict[str, Any]) -> Any:

@@ -29,9 +29,12 @@ from src.retention_engine import (
     generate_campaign_export,
     simulate_retention_scenario,
     find_optimal_threshold,
-    plot_profit_threshold_curve
+    plot_profit_threshold_curve,
+    compare_retention_strategies,
+    compute_profit_sensitivity_grid,
+    plot_profit_sensitivity_heatmap
 )
-from src.data_loader import load_customer_dashboard
+from src.data_loader import load_customer_dashboard, load_holdout_predictions
 
 st.set_page_config(
     page_title="Retention Workspace | RetainIQ",
@@ -280,15 +283,26 @@ with tab_campaign:
     )
 
 with tab_solver:
-    st.markdown("#### 🎯 Profit-Optimal Decision Threshold Solver")
+    st.markdown("#### 🎯 Profit-Optimal Decision Threshold Solver (Strict Out-of-Sample Holdout)")
+    
+    render_alert(
+        "<b>Rigorous Evaluation Notice:</b> To eliminate circular training bias and data leakage, the Profit-Optimal "
+        "Threshold Solver is evaluated <b>strictly on the held-out test cohort (N = 674)</b>, never on data used to fit model parameters. "
+        "<b>LTV Definition:</b> Customer LTV is measured as historical cumulative monetary spend (£), serving as an empirical proxy "
+        "for preserved future ordering value. <b>Scenario Limitation:</b> All profit outputs are theoretical scenario projections "
+        "conditioned on assumed campaign unit costs and retention save rates, not verified causal treatment effects (uplift).",
+        alert_type="info",
+        icon="🛡️"
+    )
+
     st.markdown(
-        "Commercial campaigns should not default blindly to an arbitrary 50% statistical cutoff ($t = 0.50$). "
+        "Standard commercial campaigns often default blindly to an arbitrary 50% statistical cutoff ($t = 0.50$). "
         "RetainIQ maximizes **Net Expected Commercial Profit** by finding the threshold $t^*$ that balances retention revenue against intervention costs: "
         r"$$\text{Net Expected Profit} = \sum_{i \in \text{TP}} (\text{LTV}_i \times \text{SaveRate}) - \sum_{i \in (\text{TP} \cup \text{FP})} \text{OutreachCost}$$",
         unsafe_allow_html=True
     )
 
-    sc1, sc2, sc3 = st.columns([1, 1, 1])
+    sc1, sc2 = st.columns([1, 1])
     with sc1:
         solver_cost = st.number_input(
             "Outreach Cost per Account (£)",
@@ -308,19 +322,9 @@ with tab_solver:
             help="Estimated percentage of contacted churners who are successfully saved."
         )
         solver_save_rate = solver_save_pct / 100.0
-    with sc3:
-        solver_scope = st.selectbox(
-            "Evaluation Dataset",
-            options=["Historical Cutoff Cohort (N = 3,370)", "Holdout Test Set (N = 674)"],
-            index=0
-        )
 
-    # Compute optimal threshold
-    if "Holdout" in solver_scope:
-        from src.data_loader import load_holdout_predictions
-        solver_data = load_holdout_predictions()
-    else:
-        solver_data = load_customer_dashboard()
+    # Load holdout predictions strictly (zero training leakage)
+    solver_data = load_holdout_predictions()
 
     opt_res = find_optimal_threshold(
         y_true=solver_data["ActualChurn"].values,
@@ -365,20 +369,48 @@ with tab_solver:
     fig_profit_curve = plot_profit_threshold_curve(opt_res)
     st.plotly_chart(fig_profit_curve, use_container_width=True)
 
-    st.markdown(
-        f"""
-        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem; margin-top: 0.5rem; font-size: 0.85rem; color: #334155; line-height: 1.55;">
-            <b>Decision Strategy Rationale:</b> At an outreach cost of <b>£{solver_cost:.2f}</b> and assumed save rate of <b>{solver_save_pct:.0f}%</b>, 
-            the mathematically optimal cutoff is <b>t* = {opt_res['optimal_threshold']:.2f}</b>. 
-            Targeting accounts at <code>ChurnProbability ≥ {opt_res['optimal_threshold']:.2f}</code> reaches <b>{opt_res['opt_targeted_count']} accounts</b>, 
-            delivering <b>{format_currency(opt_res['max_net_profit'])}</b> in net expected profit—a lift of <b>{format_currency(opt_res['profit_lift'])}</b> 
-            over the default 0.50 cutoff.
-        </div>
-        """,
-        unsafe_allow_html=True
+    st.markdown("---")
+    st.markdown("##### 📊 Multi-Strategy Intervention Benchmark (Held-Out Test Set, N = 674)")
+    st.caption(
+        "A 50% cutoff is often a strawman. Below we compare five realistic commercial targeting strategies: "
+        "doing nothing, contacting everyone, targeting by churn risk, targeting by Expected Value at Risk (LTV × P), "
+        "and applying the mathematical optimal threshold t*."
     )
-        height=400
+
+    strat_df = compare_retention_strategies(
+        y_true=solver_data["ActualChurn"].values,
+        y_prob=solver_data["ChurnProbability"].values,
+        ltv_series=solver_data["Monetary"].values,
+        outreach_cost=solver_cost,
+        save_rate=solver_save_rate
     )
+
+    display_strat = strat_df.copy()
+    display_strat["Campaign Cost (£)"] = display_strat["Campaign Cost (£)"].apply(lambda x: f"£{x:,.2f}")
+    display_strat["Gross Saved (£)"] = display_strat["Gross Saved (£)"].apply(lambda x: f"£{x:,.2f}")
+    display_strat["Net Expected Profit (£)"] = display_strat["Net Expected Profit (£)"].apply(lambda x: f"£{x:,.2f}")
+    display_strat["ROI (%)"] = display_strat["ROI (%)"].apply(lambda x: f"{x:,.1f}%")
+
+    st.dataframe(
+        display_strat,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.markdown("---")
+    st.markdown("##### 🎛️ Profit Sensitivity Grid Heatmap (Cost vs. Save Rate)")
+    st.caption(
+        "Evaluates how the optimal threshold t*, number of contacted accounts, and expected net profit vary "
+        "across unit outreach costs in {£5, £15, £30, £50} and retention save rates in {5%, 10%, 20%, 30%}."
+    )
+
+    grid_res = compute_profit_sensitivity_grid(
+        y_true=solver_data["ActualChurn"].values,
+        y_prob=solver_data["ChurnProbability"].values,
+        ltv_series=solver_data["Monetary"].values
+    )
+    fig_heatmap = plot_profit_sensitivity_heatmap(grid_res)
+    st.plotly_chart(fig_heatmap, use_container_width=True)
 
 with tab_sim:
     st.markdown("#### 🧮 Retention Action Simulator (Hypothetical Planning Tool)")

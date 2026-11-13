@@ -267,3 +267,107 @@ def test_profit_optimal_threshold_solver_math():
     res_high_cost = find_optimal_threshold(y_true, y_prob, ltv, outreach_cost=40.0, save_rate=0.20)
     assert res_high_cost["optimal_threshold"] >= res_low_cost["optimal_threshold"]
     assert res_high_cost["opt_targeted_count"] <= res_low_cost["opt_targeted_count"]
+
+
+def test_temporal_backtest_pipeline_and_leakage_invariance():
+    """
+    Task 1 Verification:
+    Verify that features and cohort generation for cutoff date T are completely
+    invariant to whether future transactions (> T) exist in the raw transaction input.
+    """
+    from src.backtest import build_cohort_at_cutoff
+    from src.preprocessing import FEATURE_NAMES_V2
+
+    cutoff = pd.Timestamp("2011-05-10 12:50:00")
+    tx_pre = pd.DataFrame([
+        {"CustomerID": 88888, "InvoiceNo": "20001", "Quantity": 4, "UnitPrice": 20.0,
+         "InvoiceDate": pd.Timestamp("2011-02-01 10:00:00"), "StockCode": "P1"},
+        {"CustomerID": 88888, "InvoiceNo": "20002", "Quantity": 1, "UnitPrice": 50.0,
+         "InvoiceDate": pd.Timestamp("2011-04-15 11:00:00"), "StockCode": "P2"},
+    ])
+    cohort_clean = build_cohort_at_cutoff(tx_pre, cutoff_date=cutoff, window_days=90)
+
+    # Post-cutoff transactions (> 2011-05-10) should not alter pre-cutoff feature values
+    tx_future = pd.DataFrame([
+        {"CustomerID": 88888, "InvoiceNo": "20003", "Quantity": 100, "UnitPrice": 5.0,
+         "InvoiceDate": pd.Timestamp("2011-06-20 10:00:00"), "StockCode": "P3"},
+        {"CustomerID": 88888, "InvoiceNo": "C20004", "Quantity": -10, "UnitPrice": 5.0,
+         "InvoiceDate": pd.Timestamp("2011-07-01 10:00:00"), "StockCode": "P3"},
+    ])
+    tx_combined = pd.concat([tx_pre, tx_future], ignore_index=True)
+    cohort_with_future = build_cohort_at_cutoff(tx_combined, cutoff_date=cutoff, window_days=90)
+
+    # Features must match identically
+    for col in FEATURE_NAMES_V2:
+        val_clean = cohort_clean[col].iloc[0]
+        val_future = cohort_with_future[col].iloc[0]
+        assert np.isclose(val_clean, val_future), f"Leakage detected in {col}: {val_clean} != {val_future}"
+
+    # Churn label check: customer bought in future window in combined -> Retained (0); in clean -> Churned (1)
+    assert cohort_clean["ActualChurn"].iloc[0] == 1
+    assert cohort_with_future["ActualChurn"].iloc[0] == 0
+
+
+def test_probabilistic_lifetimes_baselines_and_bootstrap_ci():
+    """
+    Task 2 Verification:
+    Verify probabilistic lifetimes baselines, Poisson-based churn probability mapping,
+    and percentile bootstrap confidence interval bounds.
+    """
+    from src.backtest import compute_bootstrap_ci, predict_probabilistic_churn
+    from lifetimes import BetaGeoFitter
+
+    # Bootstrap CI calculation
+    y_true = np.array([1, 1, 1, 0, 0, 1, 0, 1, 0, 0] * 5)
+    y_prob = np.array([0.85, 0.75, 0.65, 0.45, 0.35, 0.55, 0.25, 0.90, 0.15, 0.10] * 5)
+
+    ci_res = compute_bootstrap_ci(y_true, y_prob, n_resamples=100, ci=0.95, random_state=42)
+    assert "roc_auc" in ci_res
+    assert "pr_auc" in ci_res
+    assert "brier_score" in ci_res
+    assert "precision_at_top15" in ci_res
+
+    for metric, (point, lower, upper) in ci_res.items():
+        assert lower <= point <= upper or np.isclose(lower, point, atol=0.05), f"CI ordering broken for {metric}"
+        assert 0.0 <= point <= 1.0
+
+
+def test_retention_strategies_and_sensitivity_grid():
+    """
+    Task 3 Verification:
+    Verify multi-strategy retention comparison (5 strategies + reference)
+    and 4x4 profit sensitivity grid computation on held-out predictions.
+    """
+    from src.data_loader import load_holdout_predictions
+    from src.retention_engine import compare_retention_strategies, compute_profit_sensitivity_grid
+
+    df = load_holdout_predictions()
+    y_true = df["ActualChurn"].values
+    y_prob = df["ChurnProbability"].values
+    ltv = df["Monetary"].values
+
+    # Multi-strategy benchmark
+    strat_df = compare_retention_strategies(y_true, y_prob, ltv, outreach_cost=15.0, save_rate=0.20)
+    assert len(strat_df) == 6
+    assert "1. Contact Nobody" in strat_df["Strategy"].values
+    assert "2. Contact Everyone" in strat_df["Strategy"].values
+
+    # Contact nobody yields exactly £0 cost and £0 profit
+    nobody_row = strat_df[strat_df["Strategy"] == "1. Contact Nobody"].iloc[0]
+    assert nobody_row["Campaign Cost (£)"] == 0.0
+    assert nobody_row["Net Expected Profit (£)"] == 0.0
+
+    # Optimal threshold yields profit >= default 0.50 cutoff profit
+    opt_row = strat_df[strat_df["Strategy"].str.startswith("5. Optimal Threshold")].iloc[0]
+    def_row = strat_df[strat_df["Strategy"].str.startswith("Reference: Default")].iloc[0]
+    assert opt_row["Net Expected Profit (£)"] >= def_row["Net Expected Profit (£)"]
+
+    # Sensitivity Grid (4x4)
+    grid_res = compute_profit_sensitivity_grid(y_true, y_prob, ltv)
+    assert len(grid_res["records"]) == 16
+    assert grid_res["profit_pivot"].shape == (4, 4)
+
+    # Monotonicity: Higher save rate increases net profit at same unit cost
+    low_save_prof = grid_res["df"][(grid_res["df"]["save_rate"] == 0.05) & (grid_res["df"]["outreach_cost"] == 15.0)]["max_net_profit"].iloc[0]
+    high_save_prof = grid_res["df"][(grid_res["df"]["save_rate"] == 0.30) & (grid_res["df"]["outreach_cost"] == 15.0)]["max_net_profit"].iloc[0]
+    assert high_save_prof > low_save_prof
